@@ -8,6 +8,10 @@ const ROOT = __dirname, PUB = path.join(ROOT, 'public'), UP = process.env.UPLOAD
 const CLOUD = process.env.CLOUDINARY_CLOUD_NAME, CKEY = process.env.CLOUDINARY_API_KEY, CSECRET = process.env.CLOUDINARY_API_SECRET;
 const USE_CLOUD = !!(CLOUD && CKEY && CSECRET);
 const USE_MONGO = !!process.env.MONGODB_URI;
+// Online payments: Cashfree. Test (sandbox) mode by default; set CASHFREE_ENV=production only after Cashfree activates your account.
+const CF_ID = process.env.CASHFREE_APP_ID, CF_SECRET = process.env.CASHFREE_SECRET_KEY;
+const USE_CF = !!(CF_ID && CF_SECRET), CF_SANDBOX = process.env.CASHFREE_ENV !== 'production';
+const CF_BASE = CF_SANDBOX ? 'https://sandbox.cashfree.com/pg' : 'https://api.cashfree.com/pg';
 if (!USE_CLOUD) fs.mkdirSync(UP, { recursive: true });
 if (!USE_MONGO) fs.mkdirSync(DATA, { recursive: true });
 
@@ -74,13 +78,14 @@ const readBody = req => new Promise((ok, no) => { let n = 0; const c = []; req.o
 const fail = (code, msg) => { throw { code, msg }; };
 const str = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
 const CATS = ['books', 'gear', 'services', 'fashion', 'other'];
-const DEFAULT_PAY = { upi: false, cod: true, upiId: '' };
+const DEFAULT_PAY = { upi: false, cod: true, online: false, upiId: '' };
 // Reads and checks the payment methods a seller picked: UPI (with a UPI ID) and/or cash on delivery.
 function payFrom(b) {
-  const upi = !!(b && b.upi), cod = !!(b && b.cod), upiId = str(b && b.upiId, 60);
-  if (!upi && !cod) fail(400, 'Choose at least one payment method');
+  const upi = !!(b && b.upi), cod = !!(b && b.cod), online = !!(b && b.online), upiId = str(b && b.upiId, 60);
+  if (!upi && !cod && !online) fail(400, 'Choose at least one payment method');
+  if (online && !USE_CF) fail(400, 'Online payment is not set up on this server');
   if (upi && !/^[a-z0-9._-]{2,50}@[a-z][a-z0-9]{1,30}$/i.test(upiId)) fail(400, 'Enter a valid UPI ID, like name@okhdfcbank');
-  return { upi, cod, upiId: upi ? upiId : '' };
+  return { upi, cod, online, upiId: upi ? upiId : '' };
 }
 function shape(l, me) {
   const s = db.users.find(u => u.id === l.seller) || {}, rs = db.ratings.filter(r => r.seller === l.seller);
@@ -121,6 +126,14 @@ function dropImage(l) {
 }
 const limits = new Map(), seen = new Map();
 function throttle(key, max, ms) { const now = Date.now(), r = (limits.get(key) || []).filter(t => now - t < ms); if (r.length >= max) fail(429, 'Too many attempts. Try again in a few minutes.'); r.push(now); limits.set(key, r); }
+
+/* ---------- Cashfree (online payments) ---------- */
+async function cf(method, route, body) {
+  const r = await fetch(CF_BASE + route, { method, headers: { 'Content-Type': 'application/json', 'x-api-version': '2023-08-01', 'x-client-id': CF_ID, 'x-client-secret': CF_SECRET }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { console.error('Cashfree error:', r.status, j); fail(502, j.message || 'Payment service error. Try again.'); }
+  return j;
+}
 
 /* ---------- API ---------- */
 async function api(req, res, url) {
@@ -165,6 +178,39 @@ async function api(req, res, url) {
   }
   if (p[0] === 'me') return send(res, 200, { user: pub(me) });
 
+  if (p[0] === 'config') return send(res, 200, { online: USE_CF, mode: CF_SANDBOX ? 'sandbox' : 'production' });
+  if (p[0] === 'pay' && M === 'POST') {
+    need(); throttle('pay' + me.id, 12, 6e5);
+    if (!USE_CF) fail(503, 'Online payment is not set up on this server');
+    if (p[1] === 'create') {
+      const l = db.listings.find(x => x.id === +body.listing);
+      if (!l || l.status !== 'active') fail(404, 'This item is not available');
+      if (l.seller === me.id) fail(400, 'This is your own listing');
+      if (!(l.pay && l.pay.online)) fail(400, 'The seller has not turned on online payment');
+      if (l.price < 1) fail(400, 'Online payment needs a price of at least 1 rupee');
+      const orderId = 'cb_' + l.id + '_' + Date.now().toString(36) + crypto.randomBytes(3).toString('hex');
+      // customer_phone is a placeholder, fine for sandbox. For live mode, collect each buyer's real phone number.
+      const j = await cf('POST', '/orders', { order_id: orderId, order_amount: l.price, order_currency: 'INR', customer_details: { customer_id: 'u' + me.id, customer_phone: '9999999999' }, order_note: ('CampusBazaar: ' + l.title).slice(0, 80) });
+      db.orders.push({ id: orderId, listing: l.id, buyer: me.id, amount: l.price, status: 'created', at: Date.now() });
+      save(); return send(res, 200, { orderId, sessionId: j.payment_session_id, mode: CF_SANDBOX ? 'sandbox' : 'production' });
+    }
+    if (p[1] === 'verify') {
+      const o = db.orders.find(x => x.id === String(body.orderId) && x.buyer === me.id); if (!o) fail(404, 'Order not found');
+      if (o.status !== 'paid') {
+        const j = await cf('GET', '/orders/' + encodeURIComponent(o.id));
+        if (j.order_status === 'PAID' && Number(j.order_amount) === o.amount) { // confirmed by Cashfree itself, not by the browser
+          o.status = 'paid'; o.paidAt = Date.now();
+          const l = db.listings.find(x => x.id === o.listing);
+          if (l) {
+            if (l.status === 'active') l.status = 'sold';
+            db.messages.push({ id: nid(), listing: l.id, from: me.id, to: l.seller, text: 'I paid ' + o.amount + ' rupees online for "' + l.title + '"' + (CF_SANDBOX ? ' (test payment, no real money).' : '.'), at: Date.now(), read: false });
+          }
+          save();
+        }
+      }
+      return send(res, 200, { paid: o.status === 'paid' });
+    }
+  }
   if (p[0] === 'listings') {
     if (!p[1] && M === 'GET') {
       const q = (url.searchParams.get('q') || '').toLowerCase(), cat = url.searchParams.get('cat'), sort = url.searchParams.get('sort') || 'new', mine = url.searchParams.get('mine');
@@ -277,7 +323,7 @@ const server = http.createServer(async (req, res) => {
 /* ---------- start ---------- */
 (async () => {
   db = (await loadDb()) || { seq: 1, users: [], listings: [], messages: [], wish: [] };
-  db.ratings = db.ratings || []; db.reports = db.reports || [];
+  db.ratings = db.ratings || []; db.reports = db.reports || []; db.orders = db.orders || [];
   if (!db.secret) db.secret = crypto.randomBytes(32).toString('hex'); // kept in the database so logins survive restarts
   SECRET = db.secret;
   if (!db.users.length) seed();
