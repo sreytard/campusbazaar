@@ -64,7 +64,7 @@ function seed() {
    [k, 'Poster and logo design', 'services', 300, 'New', 'Same-day delivery for fests and club events. Revisions included.'],
    [r, 'Maths tutoring, evenings', 'services', 200, 'New', 'Per hour. First-year calculus and linear algebra.'],
    [m, 'Homemade brownies, weekends', 'services', 90, 'New', 'Per box of 4. Order by Friday night.']
-  ].forEach(x => db.listings.push({ id: nid(), seller: x[0].id, title: x[1], cat: x[2], price: x[3], cond: x[4], desc: x[5], image: null, status: 'active', created: Date.now() - Math.random() * 5e8 }));
+  ].forEach(x => db.listings.push({ id: nid(), seller: x[0].id, title: x[1], cat: x[2], price: x[3], cond: x[4], desc: x[5], image: null, status: 'active', pay: { upi: false, cod: true, upiId: '' }, created: Date.now() - Math.random() * 5e8 }));
 }
 
 /* ---------- http helpers ---------- */
@@ -74,10 +74,19 @@ const readBody = req => new Promise((ok, no) => { let n = 0; const c = []; req.o
 const fail = (code, msg) => { throw { code, msg }; };
 const str = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
 const CATS = ['books', 'gear', 'services', 'fashion', 'other'];
+const DEFAULT_PAY = { upi: false, cod: true, upiId: '' };
+// Reads and checks the payment methods a seller picked: UPI (with a UPI ID) and/or cash on delivery.
+function payFrom(b) {
+  const upi = !!(b && b.upi), cod = !!(b && b.cod), upiId = str(b && b.upiId, 60);
+  if (!upi && !cod) fail(400, 'Choose at least one payment method');
+  if (upi && !/^[a-z0-9._-]{2,50}@[a-z][a-z0-9]{1,30}$/i.test(upiId)) fail(400, 'Enter a valid UPI ID, like name@okhdfcbank');
+  return { upi, cod, upiId: upi ? upiId : '' };
+}
 function shape(l, me) {
   const s = db.users.find(u => u.id === l.seller) || {}, rs = db.ratings.filter(r => r.seller === l.seller);
   const talked = !!(me && me.id !== l.seller && db.messages.some(m => (m.from === me.id && m.to === l.seller) || (m.from === l.seller && m.to === me.id)));
-  return { ...l, sellerName: s.name, sellerHostel: s.hostel, wished: !!(me && db.wish.some(w => w.u === me.id && w.l === l.id)), wishes: db.wish.filter(w => w.l === l.id).length,
+  const pay = l.pay || DEFAULT_PAY; // older listings without a payment setting count as cash on delivery
+  return { ...l, pay: me ? pay : { ...pay, upiId: '' }, sellerName: s.name, sellerHostel: s.hostel, wished: !!(me && db.wish.some(w => w.u === me.id && w.l === l.id)), wishes: db.wish.filter(w => w.l === l.id).length,
     sellerRating: rs.length ? +(rs.reduce((a, r) => a + r.stars, 0) / rs.length).toFixed(1) : null, sellerRatings: rs.length, canRate: talked, myStars: me ? (rs.find(r => r.from === me.id) || {}).stars || 0 : 0 };
 }
 
@@ -170,9 +179,10 @@ async function api(req, res, url) {
       const title = str(body.title, 80), price = Math.round(+body.price);
       if (title.length < 3) fail(400, 'Give your listing a title');
       if (!(price >= 0 && price <= 1e6)) fail(400, 'Enter a valid price');
+      const pay = body.pay === undefined ? { ...DEFAULT_PAY } : payFrom(body.pay);
       if (db.listings.filter(l => l.seller === me.id && Date.now() - l.created < 6e4).length >= 3) fail(429, 'Slow down a little before posting again');
       const img = await saveImage(body.image);
-      const l = { id: nid(), seller: me.id, title, cat: CATS.includes(body.cat) ? body.cat : 'other', price, cond: str(body.cond, 20) || 'Good', desc: str(body.desc, 800), image: img ? img.url : null, imagePid: img ? img.pid : null, status: 'active', created: Date.now() };
+      const l = { id: nid(), seller: me.id, title, cat: CATS.includes(body.cat) ? body.cat : 'other', price, cond: str(body.cond, 20) || 'Good', desc: str(body.desc, 800), image: img ? img.url : null, imagePid: img ? img.pid : null, status: 'active', pay, created: Date.now() };
       db.listings.push(l); save(); return send(res, 201, { listing: shape(l, me) });
     }
     const l = db.listings.find(x => x.id === +p[1]); if (!l) fail(404, 'Listing not found');
@@ -182,6 +192,7 @@ async function api(req, res, url) {
     if (M === 'PUT') {
       const title = str(body.title, 80), price = Math.round(+body.price);
       if (title.length < 3) fail(400, 'Give your listing a title'); if (!(price >= 0 && price <= 1e6)) fail(400, 'Enter a valid price');
+      if (body.pay !== undefined) l.pay = payFrom(body.pay);
       l.title = title; l.price = price; l.cat = CATS.includes(body.cat) ? body.cat : l.cat; l.cond = str(body.cond, 20) || l.cond; l.desc = str(body.desc, 800);
       if (body.image) { const n = await saveImage(body.image); if (n) { dropImage(l); l.image = n.url; l.imagePid = n.pid; } } else if (body.removeImage) { dropImage(l); l.image = null; }
       save(); return send(res, 200, { listing: shape(l, me) });
