@@ -175,3 +175,18 @@ html[data-exam="1"]{--paper:#070a18;--card:#10142a;--text:#e8ebf8;--muted:#8a91b
 /* mobile menu */
 .menu-btn{display:none;order:1;border:0;background:rgba(127,127,160,.2);color:inherit;width:42px;height:42px;border-radius:12px;font-size:20px;cursor:pointer;margin-left:6px}
 @media(max-width:720px){.menu-btn{display:block}nav.open{flex-wrap:wrap;background:var(--ink)!important;color:#fff!important;backdrop-filter:none}nav.open a.l.hide{display:block;flex-basis:100%;order:10;padding:12px 14px}}
+
+/* phone fixes: two-row nav, smaller Prof button */
+@media(max-width:560px){
+  nav{flex-wrap:wrap;row-gap:4px;padding-left:14px;padding-right:14px}
+  nav .logo{order:0;flex:1 1 calc(100% - 56px);margin-right:0;font-size:20px}
+  .menu-btn{order:1;margin-left:0}
+  nav a.l,nav a.pill{order:2}
+  nav a.l{padding:6px 12px}
+  nav a.pill{margin-left:auto;padding:8px 16px}
+  .page{padding-top:150px}
+  .auth-main{padding-top:150px}
+}
+@media(max-width:720px){
+  #prof{right:12px;bottom:calc(10px + env(safe-area-inset-bottom,0px));padding:8px 16px;font-size:14px}
+}
