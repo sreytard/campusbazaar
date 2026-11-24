@@ -16,7 +16,7 @@ Open http://localhost:3000
 
 | Role    | Email              | Password   |
 |---------|--------------------|------------|
-| Admin   | admin@campus.edu   | admin123   |
+| Admin   | admin@campus.edu   |provided separately to the teacher (the online site uses a private password, not the default one in the code). |
 | Student | riya@campus.edu    | student123 |
 | Student | aman@campus.edu    | student123 |
 
