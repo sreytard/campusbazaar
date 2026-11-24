@@ -176,6 +176,8 @@ async function viewList(title, path, empty) {
 async function viewItem(id) {
   renderNav(false);
   const { listing: l } = await api('listings/' + id), mine = user && user.id === l.seller, box = h('div', { class: 'box' });
+  const pay = l.pay || { upi: false, cod: true, upiId: '' };
+  const payText = [pay.upi ? 'UPI' : null, pay.cod ? 'Cash on delivery' : null].filter(Boolean).join(' · ');
   const wish = h('button', { class: 'btn ghost', onclick: async () => { if (!user) return go('/login'); const r = await api('wish/' + id, 'POST'); wish.textContent = r.wished ? '♥ Saved' : '♡ Save'; toast(r.wished ? 'Saved to your list' : 'Removed from saved'); } }, l.wished ? '♥ Saved' : '♡ Save');
   if (mine || (user && user.role === 'admin')) {
     box.append(h('p', { style: 'margin-bottom:14px;color:var(--muted)' }, mine ? 'This is your listing.' : 'Admin controls'), h('div', { class: 'row' },
@@ -186,11 +188,24 @@ async function viewItem(id) {
   else if (!user) box.append(h('p', { style: 'margin-bottom:14px' }, 'Sign in to message ' + l.sellerName + '.'), h('a', { class: 'btn', href: '#/login' }, 'Sign in'));
   else { const t = h('textarea', { placeholder: `Hi ${l.sellerName.split(' ')[0]}, is this still available?` }), e = h('div', { class: 'err' });
     box.append(h('label', { style: 'margin-top:0' }, 'Message the seller'), t, e, h('button', { class: 'btn', style: 'margin-top:12px', onclick: async () => { try { await api('messages', 'POST', { listing: l.id, to: l.seller, text: t.value }); go(`/chat/${l.id}/${l.seller}`); } catch (x) { e.textContent = x.message; } } }, 'Send message')); }
+  /* payment options for buyers: UPI opens the phone's payment app, cash on delivery is paid in person */
+  let payBox = null;
+  if (user && !mine && user.role !== 'admin' && l.status !== 'sold') {
+    const upiLink = 'upi://pay?pa=' + pay.upiId + '&pn=' + encodeURIComponent(l.sellerName) + (l.price > 0 ? '&am=' + l.price : '') + '&cu=INR&tn=' + encodeURIComponent('CampusBazaar: ' + l.title.slice(0, 40));
+    const copyUpi = async () => { try { await navigator.clipboard.writeText(pay.upiId); toast('UPI ID copied'); } catch { toast('Could not copy. Select the ID and copy it by hand.'); } };
+    payBox = h('div', { class: 'box' }, h('b', null, 'How to pay'),
+      h('p', { style: 'color:var(--muted);font-size:14px;margin:6px 0 14px' }, 'Money goes straight to the seller, not through CampusBazaar. Check the item in person before you pay.'),
+      pay.upi && pay.upiId ? h('div', { style: 'margin-bottom:14px' },
+        h('div', { class: 'row' }, h('a', { class: 'btn', href: upiLink }, 'Pay ' + rupee(l.price) + ' via UPI'), h('button', { class: 'btn ghost', onclick: copyUpi }, 'Copy UPI ID')),
+        h('p', { style: 'margin-top:8px;color:var(--muted);font-size:14px' }, 'UPI ID: ' + pay.upiId + '. On a laptop, copy the ID and pay from your phone.')) : null,
+      pay.cod ? h('p', null, '💵 Cash on delivery: pay in cash when you meet the seller.') : null);
+  }
   const rateBox = l.canRate ? h('div', { class: 'box' }, h('b', null, l.myStars ? 'Your rating for ' + l.sellerName.split(' ')[0] : 'Rate ' + l.sellerName.split(' ')[0]), h('div', { class: 'row', style: 'margin-top:8px' }, [1, 2, 3, 4, 5].map(n => h('button', { class: 'star' + (n <= l.myStars ? ' on' : ''), 'aria-label': n + ' stars', onclick: async () => { try { await api('rate', 'POST', { seller: l.seller, stars: n }); toast('Thanks for rating'); viewItem(id); } catch (x) { toast(x.message); } } }, '★')))) : null;
   const reportBtn = user && !mine && user.role !== 'admin' ? h('button', { class: 'btn ghost', onclick: async () => { const r = prompt('What is wrong with this listing?'); if (!r) return; try { await api('report', 'POST', { listing: l.id, reason: r }); toast('Reported. An admin will review it.'); } catch (x) { toast(x.message); } } }, 'Report') : null;
   $app.replaceChildren(h('div', { class: 'wrap page' }, h('a', { href: '#/market', style: 'color:var(--muted)' }, '← Back to browse'), h('div', { class: 'item', style: 'margin-top:20px' }, photo(l),
     h('div', null, h('div', { class: 'meta' }, h('span', null, l.cat), h('span', null, '·'), h('span', null, l.cond), h('span', null, '·'), h('span', null, ago(l.created))), h('h1', { style: 'font-size:clamp(30px,4vw,46px)' }, l.title), h('div', { class: 'price' }, rupee(l.price)),
-      h('p', { style: 'white-space:pre-wrap' }, l.desc || 'No description added.'), h('p', { style: 'margin-top:18px;color:var(--muted)' }, `Sold by ${l.sellerName}, ${l.sellerHostel}` + (l.sellerRating ? ` · ★ ${l.sellerRating} (${l.sellerRatings})` : ' · No ratings yet')), h('div', { class: 'row', style: 'margin-top:18px' }, wish, reportBtn), rateBox, box))));
+      h('p', { style: 'white-space:pre-wrap' }, l.desc || 'No description added.'), h('p', { style: 'margin-top:18px;color:var(--muted)' }, `Sold by ${l.sellerName}, ${l.sellerHostel}` + (l.sellerRating ? ` · ★ ${l.sellerRating} (${l.sellerRatings})` : ' · No ratings yet')),
+      h('p', { style: 'margin-top:6px;color:var(--muted)' }, 'Payment: ' + payText), h('div', { class: 'row', style: 'margin-top:18px' }, wish, reportBtn), rateBox, box, payBox))));
 }
 
 /* ---------- sell ---------- */
@@ -204,13 +219,24 @@ async function viewSell(editId) {
   const file = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp', id: 'img', onchange: e => {
     const fl = e.target.files[0]; if (!fl) return; if (fl.size > 3.5e6) { err.textContent = 'Photo must be under 3.5 MB'; e.target.value = ''; return; }
     const r = new FileReader(); r.onload = () => { img = r.result; prev.textContent = 'Photo added: ' + fl.name; err.textContent = ''; }; r.readAsDataURL(fl); } });
+  /* payment methods: UPI (needs a UPI ID) and/or cash on delivery */
+  const P = L && L.pay ? L.pay : { upi: false, cod: true, upiId: '' };
+  const upiOn = h('input', { type: 'checkbox', id: 'payupi', style: 'width:auto' }), codOn = h('input', { type: 'checkbox', id: 'paycod', style: 'width:auto' });
+  const upiId = h('input', { id: 'upiid', maxlength: 60, placeholder: 'yourname@okhdfcbank', autocapitalize: 'none', autocomplete: 'off' });
+  const upiBox = h('div', null, h('label', { for: 'upiid' }, 'Your UPI ID'), upiId);
+  upiOn.checked = !!P.upi; codOn.checked = !!P.cod; upiId.value = P.upiId || '';
+  const syncUpi = () => { upiBox.style.display = upiOn.checked ? '' : 'none'; }; upiOn.addEventListener('change', syncUpi); syncUpi();
   const btn = h('button', { class: 'btn', style: 'margin-top:22px', onclick: async () => {
-    btn.disabled = true; try { const data = { title: f.title.value, cat: f.cat.value, price: f.price.value, cond: f.cond.value, desc: f.desc.value, image: img, removeImage: rm }; const r = editId ? await api('listings/' + editId, 'PUT', data) : await api('listings', 'POST', data); toast(editId ? 'Changes saved' : 'Your listing is live'); go('/item/' + r.listing.id); } catch (x) { err.textContent = x.message; btn.disabled = false; } } }, L ? 'Save changes' : 'Publish listing');
+    btn.disabled = true; try { const data = { title: f.title.value, cat: f.cat.value, price: f.price.value, cond: f.cond.value, desc: f.desc.value, image: img, removeImage: rm, pay: { upi: upiOn.checked, cod: codOn.checked, upiId: upiId.value } }; const r = editId ? await api('listings/' + editId, 'PUT', data) : await api('listings', 'POST', data); toast(editId ? 'Changes saved' : 'Your listing is live'); go('/item/' + r.listing.id); } catch (x) { err.textContent = x.message; btn.disabled = false; } } }, L ? 'Save changes' : 'Publish listing');
   const sel = (id, opts) => h('select', { id }, opts.map(o => h('option', { value: o[0] }, o[1])));
   $app.replaceChildren(h('div', { class: 'wrap page' }, h('h1', null, L ? 'Edit listing' : 'List something'), h('div', { class: 'form' },
     field('title', 'Title', h('input', { id: 'title', maxlength: 80, placeholder: 'e.g. Engineering Physics, 2nd year' })), field('cat', 'Category', sel('cat', CATS.slice(1))),
     field('price', 'Price in rupees', h('input', { id: 'price', type: 'number', min: 0, placeholder: '250' })), field('cond', 'Condition', sel('cond', ['New', 'Like new', 'Good', 'Fair'].map(x => [x, x]))),
-    field('desc', 'Description', h('textarea', { id: 'desc', maxlength: 800, placeholder: 'Edition, age, what is included, where you can meet' })), h('label', { for: 'img' }, 'Photo (optional)'), file, prev, rmBox, err, btn)));
+    field('desc', 'Description', h('textarea', { id: 'desc', maxlength: 800, placeholder: 'Edition, age, what is included, where you can meet' })),
+    h('label', null, 'How buyers can pay'),
+    h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400;margin:8px 0' }, upiOn, 'UPI (online payment)'), upiBox,
+    h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400;margin:8px 0' }, codOn, 'Cash on delivery (pay when you meet)'),
+    h('label', { for: 'img' }, 'Photo (optional)'), file, prev, rmBox, err, btn)));
   if (L) { f.title.value = L.title; f.cat.value = L.cat; f.price.value = L.price; f.cond.value = L.cond; f.desc.value = L.desc; }
 }
 
