@@ -1,9 +1,12 @@
 {
   "name": "campusbazaar",
   "version": "1.0.0",
-  "description": "Student marketplace for your campus. Zero dependencies.",
+  "description": "Student marketplace for your campus.",
   "main": "server.js",
   "scripts": { "start": "node server.js", "dev": "node --watch server.js" },
   "engines": { "node": ">=18" },
+  "dependencies": {
+    "mongodb": "^6.10.0"
+  },
   "license": "MIT"
 }
