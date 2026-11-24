@@ -1,7 +1,7 @@
 'use strict';
 /* CampusBazaar front end: vanilla JS single-page app with hash routing. */
 const $app = document.getElementById('app'), $nav = document.getElementById('nav'), $toast = document.getElementById('toast');
-let user = null, cleanup = null, unread = 0, exam = false;
+let user = null, cleanup = null, unread = 0, exam = false, cfg = { online: false, mode: 'sandbox' };
 try { exam = localStorage.getItem('exam') === '1'; } catch { }
 function applyExam() {
   document.documentElement.dataset.exam = exam ? '1' : '0';
@@ -59,6 +59,14 @@ let tt; function toast(m) { $toast.textContent = m; $toast.classList.add('on'); 
 const rupee = n => '₹' + Number(n).toLocaleString('en-IN');
 function ago(t) { const s = (Date.now() - t) / 1000; return s < 60 ? 'just now' : s < 3600 ? Math.floor(s / 60) + ' min ago' : s < 86400 ? Math.floor(s / 3600) + ' hr ago' : Math.floor(s / 86400) + ' days ago'; }
 const go = p => { location.hash = p; };
+function loadCashfree(mode) { // loads Cashfree's payment window only when a buyer actually pays online
+  return new Promise((ok, no) => {
+    const make = () => { try { ok(window.Cashfree({ mode: mode === 'production' ? 'production' : 'sandbox' })); } catch { no(new Error('Could not start the payment window')); } };
+    if (window.Cashfree) return make();
+    const s = document.createElement('script'); s.src = 'https://sdk.cashfree.com/js/v3/cashfree.js'; s.onload = make;
+    s.onerror = () => no(new Error('Could not load the payment window. Check your internet.')); document.head.append(s);
+  });
+}
 function photo(l, cls = '') {
   const d = h('div', { class: 'ph ' + cls });
   if (l.image) d.style.backgroundImage = `url("${l.image}")`; else d.innerHTML = art(l.cat);
@@ -177,7 +185,7 @@ async function viewItem(id) {
   renderNav(false);
   const { listing: l } = await api('listings/' + id), mine = user && user.id === l.seller, box = h('div', { class: 'box' });
   const pay = l.pay || { upi: false, cod: true, upiId: '' };
-  const payText = [pay.upi ? 'UPI' : null, pay.cod ? 'Cash on delivery' : null].filter(Boolean).join(' · ');
+  const payText = [pay.online && cfg.online ? 'Online in app' : null, pay.upi ? 'UPI' : null, pay.cod ? 'Cash on delivery' : null].filter(Boolean).join(' · ');
   const wish = h('button', { class: 'btn ghost', onclick: async () => { if (!user) return go('/login'); const r = await api('wish/' + id, 'POST'); wish.textContent = r.wished ? '♥ Saved' : '♡ Save'; toast(r.wished ? 'Saved to your list' : 'Removed from saved'); } }, l.wished ? '♥ Saved' : '♡ Save');
   if (mine || (user && user.role === 'admin')) {
     box.append(h('p', { style: 'margin-bottom:14px;color:var(--muted)' }, mine ? 'This is your listing.' : 'Admin controls'), h('div', { class: 'row' },
@@ -193,8 +201,22 @@ async function viewItem(id) {
   if (user && !mine && user.role !== 'admin' && l.status !== 'sold') {
     const upiLink = 'upi://pay?pa=' + pay.upiId + '&pn=' + encodeURIComponent(l.sellerName) + (l.price > 0 ? '&am=' + l.price : '') + '&cu=INR&tn=' + encodeURIComponent('CampusBazaar: ' + l.title.slice(0, 40));
     const copyUpi = async () => { try { await navigator.clipboard.writeText(pay.upiId); toast('UPI ID copied'); } catch { toast('Could not copy. Select the ID and copy it by hand.'); } };
+    const payOnline = async e => {
+      const b = e.currentTarget; b.disabled = true;
+      try {
+        const o = await api('pay/create', 'POST', { listing: l.id });
+        const sdk = await loadCashfree(o.mode);
+        const res = await sdk.checkout({ paymentSessionId: o.sessionId, redirectTarget: '_modal' });
+        const v = await api('pay/verify', 'POST', { orderId: o.orderId });
+        if (v.paid) { toast('Payment successful'); viewItem(id); return; }
+        toast(res && res.error ? res.error.message : 'Payment was not completed');
+      } catch (x) { toast(x.message); }
+      b.disabled = false;
+    };
     payBox = h('div', { class: 'box' }, h('b', null, 'How to pay'),
-      h('p', { style: 'color:var(--muted);font-size:14px;margin:6px 0 14px' }, 'Money goes straight to the seller, not through CampusBazaar. Check the item in person before you pay.'),
+      h('p', { style: 'color:var(--muted);font-size:14px;margin:6px 0 14px' }, 'UPI and cash payments go straight to the seller, not through CampusBazaar. Check the item in person before you pay.'),
+      pay.online && cfg.online ? h('div', { style: 'margin-bottom:14px' }, h('button', { class: 'btn', onclick: payOnline }, 'Pay ' + rupee(l.price) + ' online'),
+        h('p', { style: 'margin-top:8px;color:var(--muted);font-size:14px' }, cfg.mode === 'sandbox' ? 'Test mode: use Cashfree test card or UPI details. No real money is charged.' : 'Pay safely with UPI, card or netbanking.')) : null,
       pay.upi && pay.upiId ? h('div', { style: 'margin-bottom:14px' },
         h('div', { class: 'row' }, h('a', { class: 'btn', href: upiLink }, 'Pay ' + rupee(l.price) + ' via UPI'), h('button', { class: 'btn ghost', onclick: copyUpi }, 'Copy UPI ID')),
         h('p', { style: 'margin-top:8px;color:var(--muted);font-size:14px' }, 'UPI ID: ' + pay.upiId + '. On a laptop, copy the ID and pay from your phone.')) : null,
@@ -221,21 +243,22 @@ async function viewSell(editId) {
     const r = new FileReader(); r.onload = () => { img = r.result; prev.textContent = 'Photo added: ' + fl.name; err.textContent = ''; }; r.readAsDataURL(fl); } });
   /* payment methods: UPI (needs a UPI ID) and/or cash on delivery */
   const P = L && L.pay ? L.pay : { upi: false, cod: true, upiId: '' };
-  const upiOn = h('input', { type: 'checkbox', id: 'payupi', style: 'width:auto' }), codOn = h('input', { type: 'checkbox', id: 'paycod', style: 'width:auto' });
+  const upiOn = h('input', { type: 'checkbox', id: 'payupi', style: 'width:auto' }), codOn = h('input', { type: 'checkbox', id: 'paycod', style: 'width:auto' }), onlineOn = h('input', { type: 'checkbox', id: 'payonline', style: 'width:auto' });
   const upiId = h('input', { id: 'upiid', maxlength: 60, placeholder: 'yourname@okhdfcbank', autocapitalize: 'none', autocomplete: 'off' });
   const upiBox = h('div', null, h('label', { for: 'upiid' }, 'Your UPI ID'), upiId);
-  upiOn.checked = !!P.upi; codOn.checked = !!P.cod; upiId.value = P.upiId || '';
+  upiOn.checked = !!P.upi; codOn.checked = !!P.cod; onlineOn.checked = !!P.online && cfg.online; upiId.value = P.upiId || '';
   const syncUpi = () => { upiBox.style.display = upiOn.checked ? '' : 'none'; }; upiOn.addEventListener('change', syncUpi); syncUpi();
   const btn = h('button', { class: 'btn', style: 'margin-top:22px', onclick: async () => {
-    btn.disabled = true; try { const data = { title: f.title.value, cat: f.cat.value, price: f.price.value, cond: f.cond.value, desc: f.desc.value, image: img, removeImage: rm, pay: { upi: upiOn.checked, cod: codOn.checked, upiId: upiId.value } }; const r = editId ? await api('listings/' + editId, 'PUT', data) : await api('listings', 'POST', data); toast(editId ? 'Changes saved' : 'Your listing is live'); go('/item/' + r.listing.id); } catch (x) { err.textContent = x.message; btn.disabled = false; } } }, L ? 'Save changes' : 'Publish listing');
+    btn.disabled = true; try { const data = { title: f.title.value, cat: f.cat.value, price: f.price.value, cond: f.cond.value, desc: f.desc.value, image: img, removeImage: rm, pay: { upi: upiOn.checked, cod: codOn.checked, online: cfg.online && onlineOn.checked, upiId: upiId.value } }; const r = editId ? await api('listings/' + editId, 'PUT', data) : await api('listings', 'POST', data); toast(editId ? 'Changes saved' : 'Your listing is live'); go('/item/' + r.listing.id); } catch (x) { err.textContent = x.message; btn.disabled = false; } } }, L ? 'Save changes' : 'Publish listing');
   const sel = (id, opts) => h('select', { id }, opts.map(o => h('option', { value: o[0] }, o[1])));
   $app.replaceChildren(h('div', { class: 'wrap page' }, h('h1', null, L ? 'Edit listing' : 'List something'), h('div', { class: 'form' },
     field('title', 'Title', h('input', { id: 'title', maxlength: 80, placeholder: 'e.g. Engineering Physics, 2nd year' })), field('cat', 'Category', sel('cat', CATS.slice(1))),
     field('price', 'Price in rupees', h('input', { id: 'price', type: 'number', min: 0, placeholder: '250' })), field('cond', 'Condition', sel('cond', ['New', 'Like new', 'Good', 'Fair'].map(x => [x, x]))),
     field('desc', 'Description', h('textarea', { id: 'desc', maxlength: 800, placeholder: 'Edition, age, what is included, where you can meet' })),
     h('label', null, 'How buyers can pay'),
-    h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400;margin:8px 0' }, upiOn, 'UPI (online payment)'), upiBox,
+    h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400;margin:8px 0' }, upiOn, 'UPI (buyer pays your UPI ID directly)'), upiBox,
     h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400;margin:8px 0' }, codOn, 'Cash on delivery (pay when you meet)'),
+    cfg.online ? h('label', { style: 'display:flex;gap:8px;align-items:center;font-weight:400;margin:8px 0' }, onlineOn, 'Online payment in the app (card, UPI, netbanking)') : null,
     h('label', { for: 'img' }, 'Photo (optional)'), file, prev, rmBox, err, btn)));
   if (L) { f.title.value = L.title; f.cat.value = L.cat; f.price.value = L.price; f.cond.value = L.cond; f.desc.value = L.desc; }
 }
@@ -329,4 +352,4 @@ async function router() {
   } catch (e) { renderNav(false); $app.replaceChildren(h('div', { class: 'wrap page' }, h('div', { class: 'empty' }, e.message))); }
 }
 addEventListener('hashchange', router); applyExam();
-(async () => { try { user = (await api('me')).user; await refreshUnread(); } catch { } router(); })();
+(async () => { try { cfg = await api('config'); } catch { } try { user = (await api('me')).user; await refreshUnread(); } catch { } router(); })();
