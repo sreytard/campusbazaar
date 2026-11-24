@@ -195,7 +195,8 @@ html[data-exam="1"]{--paper:#070a18;--card:#10142a;--text:#e8ebf8;--muted:#8a91b
 .site-foot{background:var(--ink);color:rgba(255,255,255,.75);text-align:center;padding:36px 20px;border-top:1px solid rgba(255,255,255,.08);font-size:14px;line-height:1.7}
 .site-foot b{color:#fff;font-size:18px;font-weight:600}
 .foot-main{font-size:15px}
+.foot-main b{font-size:16px}
 .foot-team{margin-top:4px}
 .foot-team span+span::before{content:" \00b7  "}
 .foot-small{margin-top:10px;opacity:.6;font-size:13px}
-@media(max-width:560px){.site-foot{padding-bottom:84px}.foot-team span{display:block}.foot-team span+span::before{content:""}}
+@media(max-width:560px){.site-foot{padding-bottom:84px}.foot-main{font-size:14px}.foot-main b{font-size:15px}.foot-team span{display:block}.foot-team span+span::before{content:""}}
