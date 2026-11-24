@@ -1,25 +1,43 @@
 'use strict';
-// CampusBazaar server: zero dependencies, Node 18+. Data lives in data/db.json.
+// CampusBazaar server. Node 18+. Only dependency: mongodb (used when MONGODB_URI is set).
+// Storage: MongoDB Atlas if MONGODB_URI is set, otherwise data/db.json (local mode).
+// Photos: Cloudinary if CLOUDINARY_* variables are set, otherwise the uploads folder (local mode).
 const http = require('http'), fs = require('fs'), path = require('path'), crypto = require('crypto');
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname, PUB = path.join(ROOT, 'public'), UP = process.env.UPLOAD_DIR || path.join(ROOT, 'uploads'), DATA = process.env.DATA_DIR || path.join(ROOT, 'data');
-[UP, DATA].forEach(d => fs.mkdirSync(d, { recursive: true }));
+const CLOUD = process.env.CLOUDINARY_CLOUD_NAME, CKEY = process.env.CLOUDINARY_API_KEY, CSECRET = process.env.CLOUDINARY_API_SECRET;
+const USE_CLOUD = !!(CLOUD && CKEY && CSECRET);
+const USE_MONGO = !!process.env.MONGODB_URI;
+if (!USE_CLOUD) fs.mkdirSync(UP, { recursive: true });
+if (!USE_MONGO) fs.mkdirSync(DATA, { recursive: true });
 
 /* ---------- storage ---------- */
 const DB_FILE = path.join(DATA, 'db.json');
-let db = fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) : { seq: 1, users: [], listings: [], messages: [], wish: [] };
-db.ratings = db.ratings || []; db.reports = db.reports || [];
-let saveTimer = null;
-function save() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DB_FILE + '.tmp', DB_FILE); }, 80);
+let db = null, col = null, SECRET = '', saveTimer = null, saving = Promise.resolve();
+
+async function loadDb() {
+  if (USE_MONGO) {
+    const { MongoClient } = require('mongodb');
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    col = client.db(process.env.MONGODB_DB || 'campusbazaar').collection('state');
+    const doc = await col.findOne({ _id: 'main' });
+    if (doc) { delete doc._id; return doc; }
+    return null;
+  }
+  return fs.existsSync(DB_FILE) ? JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) : null;
 }
-function flush() { clearTimeout(saveTimer); fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DB_FILE + '.tmp', DB_FILE); }
-['SIGTERM', 'SIGINT'].forEach(sg => process.on(sg, () => { flush(); process.exit(0); }));
+function persist() {
+  saving = saving.then(async () => {
+    if (col) await col.replaceOne({ _id: 'main' }, { _id: 'main', ...db }, { upsert: true });
+    else { fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db)); fs.renameSync(DB_FILE + '.tmp', DB_FILE); }
+  }).catch(e => console.error('Save failed:', e.message));
+  return saving;
+}
+function save() { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 80); }
+function flush() { clearTimeout(saveTimer); return persist(); }
+['SIGTERM', 'SIGINT'].forEach(sg => process.on(sg, () => { if (!db) process.exit(0); flush().finally(() => process.exit(0)); }));
 const nid = () => db.seq++;
-const SECRET_FILE = path.join(DATA, 'secret.txt');
-if (!fs.existsSync(SECRET_FILE)) fs.writeFileSync(SECRET_FILE, crypto.randomBytes(32).toString('hex'));
-const SECRET = fs.readFileSync(SECRET_FILE, 'utf8');
 
 /* ---------- auth helpers ---------- */
 const hash = (pw, salt = crypto.randomBytes(16).toString('hex')) => salt + ':' + crypto.scryptSync(pw, salt, 64).toString('hex');
@@ -35,7 +53,7 @@ function sessionUser(req) {
 const pub = u => u && ({ id: u.id, name: u.name, hostel: u.hostel, role: u.role, email: u.email });
 
 /* ---------- seed ---------- */
-if (!db.users.length) {
+function seed() {
   const mk = (name, email, hostel, role = 'student') => { const u = { id: nid(), name, email, hostel, role, pass: hash(role === 'admin' ? (process.env.ADMIN_PASSWORD || 'admin123') : 'student123'), created: Date.now() }; db.users.push(u); return u; };
   const a = mk('Campus Admin', 'admin@campus.edu', 'Admin Block', 'admin'), r = mk('Riya Sharma', 'riya@campus.edu', 'Hostel B'), m = mk('Aman Verma', 'aman@campus.edu', 'Block C'), k = mk('Kabir Singh', 'kabir@campus.edu', 'Hostel A');
   [[r, 'Engineering Mathematics, 3rd sem', 'books', 180, 'Good', 'Lightly highlighted, no torn pages. Same edition the department asked for.'],
@@ -47,7 +65,6 @@ if (!db.users.length) {
    [r, 'Maths tutoring, evenings', 'services', 200, 'New', 'Per hour. First-year calculus and linear algebra.'],
    [m, 'Homemade brownies, weekends', 'services', 90, 'New', 'Per box of 4. Order by Friday night.']
   ].forEach(x => db.listings.push({ id: nid(), seller: x[0].id, title: x[1], cat: x[2], price: x[3], cond: x[4], desc: x[5], image: null, status: 'active', created: Date.now() - Math.random() * 5e8 }));
-  save();
 }
 
 /* ---------- http helpers ---------- */
@@ -63,12 +80,36 @@ function shape(l, me) {
   return { ...l, sellerName: s.name, sellerHostel: s.hostel, wished: !!(me && db.wish.some(w => w.u === me.id && w.l === l.id)), wishes: db.wish.filter(w => w.l === l.id).length,
     sellerRating: rs.length ? +(rs.reduce((a, r) => a + r.stars, 0) / rs.length).toFixed(1) : null, sellerRatings: rs.length, canRate: talked, myStars: me ? (rs.find(r => r.from === me.id) || {}).stars || 0 : 0 };
 }
-function saveImage(dataUrl) {
+
+/* ---------- photos: Cloudinary or local disk ---------- */
+async function cloudCall(action, fields) {
+  const ts = Math.floor(Date.now() / 1000), params = { ...fields, timestamp: ts };
+  const toSign = Object.keys(params).sort().map(k => k + '=' + params[k]).join('&');
+  const form = new FormData();
+  Object.keys(params).forEach(k => form.append(k, params[k]));
+  form.append('api_key', CKEY);
+  form.append('signature', crypto.createHash('sha1').update(toSign + CSECRET).digest('hex'));
+  return fetch(`https://api.cloudinary.com/v1_1/${CLOUD}/image/${action}`, { method: 'POST', body: form });
+}
+// Returns { url, pid } or null. pid is the Cloudinary id (null for local files).
+async function saveImage(dataUrl) {
   const m = /^data:image\/(png|jpeg|webp);base64,(.+)$/.exec(dataUrl || ''); if (!m) return null;
   const buf = Buffer.from(m[2], 'base64'); if (buf.length > 4e6) fail(413, 'Image must be under 4 MB');
-  const name = crypto.randomBytes(8).toString('hex') + '.' + (m[1] === 'jpeg' ? 'jpg' : m[1]); fs.writeFileSync(path.join(UP, name), buf); return '/uploads/' + name;
+  if (USE_CLOUD) {
+    const r = await cloudCall('upload', { file: dataUrl, folder: 'campusbazaar' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.secure_url) { console.error('Cloudinary upload failed:', j); fail(502, 'Photo upload failed. Try again.'); }
+    return { url: j.secure_url, pid: j.public_id };
+  }
+  const name = crypto.randomBytes(8).toString('hex') + '.' + (m[1] === 'jpeg' ? 'jpg' : m[1]); fs.writeFileSync(path.join(UP, name), buf);
+  return { url: '/uploads/' + name, pid: null };
 }
-const dropImage = u => { if (u && u.startsWith('/uploads/')) fs.unlink(path.join(UP, path.basename(u)), () => { }); };
+function dropImage(l) {
+  if (!l || !l.image) return;
+  if (l.imagePid && USE_CLOUD) cloudCall('destroy', { public_id: l.imagePid }).catch(() => { });
+  else if (l.image.startsWith('/uploads/')) fs.unlink(path.join(UP, path.basename(l.image)), () => { });
+  l.imagePid = null;
+}
 const limits = new Map(), seen = new Map();
 function throttle(key, max, ms) { const now = Date.now(), r = (limits.get(key) || []).filter(t => now - t < ms); if (r.length >= max) fail(429, 'Too many attempts. Try again in a few minutes.'); r.push(now); limits.set(key, r); }
 
@@ -130,18 +171,19 @@ async function api(req, res, url) {
       if (title.length < 3) fail(400, 'Give your listing a title');
       if (!(price >= 0 && price <= 1e6)) fail(400, 'Enter a valid price');
       if (db.listings.filter(l => l.seller === me.id && Date.now() - l.created < 6e4).length >= 3) fail(429, 'Slow down a little before posting again');
-      const l = { id: nid(), seller: me.id, title, cat: CATS.includes(body.cat) ? body.cat : 'other', price, cond: str(body.cond, 20) || 'Good', desc: str(body.desc, 800), image: saveImage(body.image), status: 'active', created: Date.now() };
+      const img = await saveImage(body.image);
+      const l = { id: nid(), seller: me.id, title, cat: CATS.includes(body.cat) ? body.cat : 'other', price, cond: str(body.cond, 20) || 'Good', desc: str(body.desc, 800), image: img ? img.url : null, imagePid: img ? img.pid : null, status: 'active', created: Date.now() };
       db.listings.push(l); save(); return send(res, 201, { listing: shape(l, me) });
     }
     const l = db.listings.find(x => x.id === +p[1]); if (!l) fail(404, 'Listing not found');
     if (M === 'GET') return send(res, 200, { listing: shape(l, me) });
     need(); if (l.seller !== me.id && me.role !== 'admin') fail(403, 'Not your listing');
-    if (M === 'DELETE') { dropImage(l.image); db.listings = db.listings.filter(x => x !== l); db.wish = db.wish.filter(w => w.l !== l.id); db.reports.forEach(r => { if (r.listing === l.id) r.done = true; }); save(); return send(res, 200, { ok: true }); }
+    if (M === 'DELETE') { dropImage(l); db.listings = db.listings.filter(x => x !== l); db.wish = db.wish.filter(w => w.l !== l.id); db.reports.forEach(r => { if (r.listing === l.id) r.done = true; }); save(); return send(res, 200, { ok: true }); }
     if (M === 'PUT') {
       const title = str(body.title, 80), price = Math.round(+body.price);
       if (title.length < 3) fail(400, 'Give your listing a title'); if (!(price >= 0 && price <= 1e6)) fail(400, 'Enter a valid price');
       l.title = title; l.price = price; l.cat = CATS.includes(body.cat) ? body.cat : l.cat; l.cond = str(body.cond, 20) || l.cond; l.desc = str(body.desc, 800);
-      if (body.image) { const n = saveImage(body.image); if (n) { dropImage(l.image); l.image = n; } } else if (body.removeImage) { dropImage(l.image); l.image = null; }
+      if (body.image) { const n = await saveImage(body.image); if (n) { dropImage(l); l.image = n.url; l.imagePid = n.pid; } } else if (body.removeImage) { dropImage(l); l.image = null; }
       save(); return send(res, 200, { listing: shape(l, me) });
     }
     if (M === 'POST' && p[2] === 'status') { l.status = l.status === 'sold' ? 'active' : 'sold'; save(); return send(res, 200, { listing: shape(l, me) }); }
@@ -208,7 +250,7 @@ function serveFile(res, file, cache) {
     res.end(d);
   });
 }
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
     if (url.pathname === '/healthz') return send(res, 200, { ok: true });
@@ -219,4 +261,15 @@ http.createServer(async (req, res) => {
     if (!file.startsWith(root)) { res.writeHead(403); return res.end(); }
     serveFile(res, file, root === UP ? 'public, max-age=604800' : 'no-cache');
   } catch (e) { send(res, e.code || 500, { error: e.msg || 'Something went wrong' }); if (!e.code) console.error(e); }
-}).listen(PORT, () => console.log(`\n  CampusBazaar running at http://localhost:${PORT}\n  Admin login: admin@campus.edu / admin123\n  Student login: riya@campus.edu / student123\n`));
+});
+
+/* ---------- start ---------- */
+(async () => {
+  db = (await loadDb()) || { seq: 1, users: [], listings: [], messages: [], wish: [] };
+  db.ratings = db.ratings || []; db.reports = db.reports || [];
+  if (!db.secret) db.secret = crypto.randomBytes(32).toString('hex'); // kept in the database so logins survive restarts
+  SECRET = db.secret;
+  if (!db.users.length) seed();
+  await flush();
+  server.listen(PORT, () => console.log(`\n  CampusBazaar running at http://localhost:${PORT}\n  Data: ${USE_MONGO ? 'MongoDB Atlas' : 'local file'} | Photos: ${USE_CLOUD ? 'Cloudinary' : 'local folder'}\n`));
+})().catch(e => { console.error('Startup failed:', e.message); process.exit(1); });
